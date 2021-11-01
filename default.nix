@@ -75,6 +75,24 @@ let
             sha256 = "0sw7jwj3ixr0nnh3i9yagiqjsvf83w79jd7ac9vdvm410jfjcnxf";
           };
         };
+        ghc = let ghcSrc = builtins.fetchTarball {
+          url = "https://gitlab.haskell.org/ghc/ghc/-/archive/ghc-9.0.1-release/ghc-ghc-9.0.1-release.tar.gz";
+          sha256 = "03shlhpkdwprk24bbzbl3swgxx28x5cz04915307iahqgv601zzl";
+        }; in {
+          name = "ghc";
+          src = pkgs.runCommand "ghc-src-filtered" { } ''
+            mkdir -p $out
+            cd ${ghcSrc}
+            for f in $(
+              find -regextype posix-extended -regex \
+                '^((.*should_(run|compile)|\./compiler).*\.hs|.*\.hsig)$' \
+                | grep -E -v '(haddock(A004|A011|C004|C011)|cgrun(071|075|076|077)|T12136)\.hs'
+            ); do
+              mkdir -p $out/$(dirname $f)
+              cp $f $out/$f
+            done
+          '';
+        };
       };
       ormolizablePackages = pkgs.haskellPackages.override {
         overrides = ormolizeOverlay;
