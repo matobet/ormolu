@@ -18,6 +18,7 @@ where
 
 import GHC.Generics (Generic)
 import qualified GHC.Types.SrcLoc as GHC
+import Ormolu.Fixity (FixityConfig, defaultFixityConfig)
 import Ormolu.Terminal (ColorMode (..))
 
 -- | Type of sources that can be formatted by Ormolu.
@@ -43,7 +44,9 @@ data Config region = Config
     -- | Whether to use colors and other features of ANSI terminals
     cfgColorMode :: !ColorMode,
     -- | Region selection
-    cfgRegion :: !region
+    cfgRegion :: !region,
+    -- | Fixity Config
+    cfgFixityConfig :: !FixityConfig
   }
   deriving (Eq, Show, Functor, Generic)
 
@@ -80,7 +83,8 @@ defaultConfig =
         RegionIndices
           { regionStartLine = Nothing,
             regionEndLine = Nothing
-          }
+          },
+      cfgFixityConfig = defaultFixityConfig
     }
 
 -- | Convert 'RegionIndices' into 'RegionDeltas'.

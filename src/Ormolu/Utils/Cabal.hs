@@ -1,13 +1,15 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ViewPatterns #-}
 
-module Ormolu.Utils.Extensions
+module Ormolu.Utils.Cabal
   ( Extension (..),
     getExtensionsFromCabalFile,
     findCabalFile,
     getCabalExtensionDynOptions,
+    getCabalDependencies,
   )
 where
 
@@ -29,6 +31,32 @@ import System.Directory
 import System.FilePath
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error (isDoesNotExistError)
+
+getCabalDependencies ::
+  MonadIO m =>
+  -- | Haskell source file
+  FilePath ->
+  m [String]
+getCabalDependencies sourceFile' = liftIO $ do
+  sourceFile <- makeAbsolute sourceFile'
+  findCabalFile sourceFile >>= \case
+    Just cabalFile -> getDependenciesFromCabalFile cabalFile
+    Nothing -> note $ "Could not find a .cabal file for " <> sourceFile'
+  where
+    note msg = [] <$ hPutStrLn stderr msg
+
+getDependenciesFromCabalFile ::
+  MonadIO m =>
+  -- | Path to cabal file
+  FilePath ->
+  m [String]
+getDependenciesFromCabalFile cabalFile = liftIO $ do
+  GenericPackageDescription {packageDescription} <-
+    parseGenericPackageDescriptionMaybe <$> B.readFile cabalFile >>= \case
+      Just gpd -> pure gpd
+      Nothing -> throwIO $ OrmoluCabalFileParsingFailed cabalFile
+  let dependencies = allBuildDepends packageDescription
+  return $ unPackageName . depPkgName <$> dependencies
 
 -- | Get a map from Haskell source file paths (without any extensions)
 -- to its default language extensions
@@ -120,7 +148,6 @@ findCabalFile p = liftIO $ do
         else findCabalFile parentDir
 
 -- | Get the default language extensions of a Haskell source file.
--- The .cabal file can be provided explicitly or auto-detected.
 getCabalExtensionDynOptions ::
   MonadIO m =>
   -- | Haskell source file

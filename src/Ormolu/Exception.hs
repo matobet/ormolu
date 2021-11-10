@@ -6,11 +6,13 @@
 module Ormolu.Exception
   ( OrmoluException (..),
     withPrettyOrmoluExceptions,
+    fromEitherWith,
   )
 where
 
 import Control.Exception
 import Control.Monad (forM_)
+import Control.Monad.IO.Class (MonadIO (liftIO))
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Text as T
@@ -37,6 +39,8 @@ data OrmoluException
   | -- | Missing input file path when using stdin input and
     -- accounting for .cabal files
     OrmoluMissingStdinInputFile
+  | -- | Invalid fixity configuration
+    OrmoluInvalidFixityConfig [String]
   deriving (Eq, Show)
 
 instance Exception OrmoluException
@@ -95,6 +99,13 @@ printOrmoluException = \case
     newline
     put "from stdin and accounting for .cabal files"
     newline
+  OrmoluInvalidFixityConfig errors -> do
+    put "The fixity configuration is invalid:"
+    newline
+    forM_ errors $ \err -> do
+      put "  "
+      putS err
+      newline
 
 -- | Inside this wrapper 'OrmoluException' will be caught and displayed
 -- nicely.
@@ -119,3 +130,9 @@ withPrettyOrmoluExceptions colorMode m = m `catch` h
           OrmoluUnrecognizedOpts {} -> 7
           OrmoluCabalFileParsingFailed {} -> 8
           OrmoluMissingStdinInputFile {} -> 9
+          OrmoluInvalidFixityConfig {} -> 10
+
+fromEitherWith :: (MonadIO m, Exception e) => (l -> e) -> Either l r -> m r
+fromEitherWith exBuilder = \case
+  Left err -> liftIO . throwIO . exBuilder $ err
+  Right v -> return v

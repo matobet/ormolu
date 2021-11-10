@@ -1,5 +1,8 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
@@ -9,24 +12,35 @@ module Main (main) where
 import Control.Exception (throwIO)
 import Control.Monad
 import Data.Bool (bool)
+import qualified Data.HashMap.Strict as HashMap
 import Data.List (intercalate, sort)
 import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Text (Text, pack, replace, unpack)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
 import Development.GitRev
+import GHC.Types.Fixity (FixityDirection (..))
 import Options.Applicative
 import Ormolu
 import Ormolu.Diff.Text (diffText, printTextDiff)
+import Ormolu.Fixity
+  ( ConflictStrategy (..),
+    FixityConfig (..),
+    FixityInfo (..),
+    PackageConfig (..),
+    defaultConflictStrategy,
+  )
 import Ormolu.Parser (manualExts)
 import Ormolu.Terminal
 import Ormolu.Utils (showOutputable)
-import Ormolu.Utils.Extensions (getCabalExtensionDynOptions)
+import Ormolu.Utils.Cabal (getCabalDependencies, getCabalExtensionDynOptions)
 import Ormolu.Utils.IO
 import Paths_ormolu (version)
 import System.Exit (ExitCode (..), exitWith)
 import qualified System.FilePath as FP
 import System.IO (hPutStrLn, stderr)
+import Text.Regex.Pcre2 (capture, regex)
 
 -- | Entry point of the program.
 main :: IO ()
@@ -60,8 +74,8 @@ main = do
 
 -- | Format a single input.
 formatOne ::
-  -- | Whether to respect default-extensions from .cabal files
-  CabalDefaultExtensionsOpts ->
+  -- | How to use .cabal files
+  CabalOpts ->
   -- | Mode of operation
   Mode ->
   -- | The 'SourceType' requested by the user
@@ -71,19 +85,26 @@ formatOne ::
   -- | File to format or stdin as 'Nothing'
   Maybe FilePath ->
   IO ExitCode
-formatOne CabalDefaultExtensionsOpts {..} mode reqSourceType rawConfig mpath =
+formatOne CabalOpts {..} mode reqSourceType rawConfig mpath =
   withPrettyOrmoluExceptions (cfgColorMode rawConfig) $ do
     case FP.normalise <$> mpath of
       -- input source = STDIN
       Nothing -> do
         resultConfig <-
-          patchConfig Nothing
-            <$> if optUseCabalDefaultExtensions
-              then case optStdinInputFile of
-                Just stdinInputFile ->
-                  getCabalExtensionDynOptions stdinInputFile
-                Nothing -> throwIO OrmoluMissingStdinInputFile
-              else pure []
+          if optUseCabalDefaultExtensions || optUseCabalDependencies
+            then case optStdinInputFile of
+              Just stdinInputFile ->
+                patchConfig Nothing
+                  <$> ( if optUseCabalDefaultExtensions
+                          then getCabalExtensionDynOptions stdinInputFile
+                          else pure []
+                      )
+                  <*> ( if optUseCabalDependencies
+                          then getCabalDependencies stdinInputFile
+                          else pure []
+                      )
+              Nothing -> throwIO $ OrmoluMissingStdinInputFile
+            else pure $ patchConfig Nothing [] []
         case mode of
           Stdout -> do
             ormoluStdin resultConfig >>= TIO.putStr
@@ -105,9 +126,14 @@ formatOne CabalDefaultExtensionsOpts {..} mode reqSourceType rawConfig mpath =
       Just inputFile -> do
         resultConfig <-
           patchConfig (Just (detectSourceType inputFile))
-            <$> if optUseCabalDefaultExtensions
-              then getCabalExtensionDynOptions inputFile
-              else pure []
+            <$> ( if optUseCabalDefaultExtensions
+                    then getCabalExtensionDynOptions inputFile
+                    else pure []
+                )
+            <*> ( if optUseCabalDependencies
+                    then getCabalDependencies inputFile
+                    else pure []
+                )
         case mode of
           Stdout -> do
             ormoluFile resultConfig inputFile >>= TIO.putStr
@@ -127,13 +153,17 @@ formatOne CabalDefaultExtensionsOpts {..} mode reqSourceType rawConfig mpath =
               ormolu resultConfig inputFile (T.unpack originalInput)
             handleDiff originalInput formattedInput inputFile
   where
-    patchConfig mdetectedSourceType dynOpts =
+    patchConfig mdetectedSourceType dynOpts cabalDependencies =
       rawConfig
         { cfgDynOptions = cfgDynOptions rawConfig ++ dynOpts,
           cfgSourceType =
             fromMaybe
               ModuleSource
-              (reqSourceType <|> mdetectedSourceType)
+              (reqSourceType <|> mdetectedSourceType),
+          cfgFixityConfig =
+            (cfgFixityConfig rawConfig)
+              { fcDetectedCabalDependencies = cabalDependencies
+              }
         }
     handleDiff originalInput formattedInput fileRepr =
       case diffText originalInput formattedInput fileRepr of
@@ -154,7 +184,7 @@ data Opts = Opts
     -- | Ormolu 'Config'
     optConfig :: !(Config RegionIndices),
     -- | Options for respecting default-extensions from .cabal files
-    optCabalDefaultExtensions :: CabalDefaultExtensionsOpts,
+    optCabalDefaultExtensions :: CabalOpts,
     -- | Source type option, where 'Nothing' means autodetection
     optSourceType :: !(Maybe SourceType),
     -- | Haskell source files to format or stdin (when the list is empty)
@@ -172,11 +202,12 @@ data Mode
     Check
   deriving (Eq, Show)
 
--- | Configuration for how to account for default-extension
--- from .cabal files
-data CabalDefaultExtensionsOpts = CabalDefaultExtensionsOpts
+-- | Configuration for how to use .cabal files
+data CabalOpts = CabalOpts
   { -- | Account for default-extensions from .cabal files
     optUseCabalDefaultExtensions :: Bool,
+    -- | Use dependencies listed in .cabal files to infer operator fixities
+    optUseCabalDependencies :: Bool,
     -- | Optional path to a file which will be used to
     -- find a .cabal file when using input from stdin
     optStdinInputFile :: Maybe FilePath
@@ -204,7 +235,7 @@ optsParserInfo =
               $gitBranch,
               $gitHash
             ],
-          "using ghc-lib-parser " ++ VERSION_ghc_lib_parser
+          "using ghc-lib-parser " ++ "9.2.1.20211101"
         ]
     exts :: Parser (a -> a)
     exts =
@@ -230,21 +261,31 @@ optsParser =
               ]
         )
     <*> configParser
-    <*> cabalDefaultExtensionsParser
+    <*> cabalOptsParser
     <*> sourceTypeParser
     <*> (many . strArgument . mconcat)
       [ metavar "FILE",
         help "Haskell source files to format or stdin (the default)"
       ]
 
-cabalDefaultExtensionsParser :: Parser CabalDefaultExtensionsOpts
-cabalDefaultExtensionsParser =
-  CabalDefaultExtensionsOpts
+cabalOptsParser :: Parser CabalOpts
+cabalOptsParser =
+  CabalOpts
     <$> (switch . mconcat)
       [ short 'e',
         long "cabal-default-extensions",
         help "Account for default-extensions from .cabal files"
       ]
+    <*> ( (flag' False . mconcat)
+            [ long "no-cabal-dependencies",
+              help "Do not use dependencies listed in .cabal files to infer operator fixities"
+            ]
+            <|> (flag' True . mconcat)
+              [ long "cabal-dependencies",
+                help "Use dependencies listed in .cabal files to infer operator fixities (default)"
+              ]
+            <|> pure True
+        )
     <*> (optional . strOption . mconcat)
       [ long "stdin-input-file",
         help "Path which will be used to find the .cabal file when using input from stdin"
@@ -296,6 +337,35 @@ configParser =
                 help "End line of the region to format (inclusive)"
               ]
         )
+    <*> ( FixityConfig
+            <$> ( fmap HashMap.fromList . many $
+                    (option parseFcOpManualConfig . mconcat)
+                      [ long "fixconf",
+                        metavar "FIX_DECL",
+                        help "Operator fixity declaration (examples: --fixconf ':>'=infixr-0 --fixconf ':=>'=0-1 -fixconf ':$>'=infix-2-9 )"
+                      ]
+                )
+            <*> ( many $
+                    (option parseFcPackageManualConfig . mconcat)
+                      [ long "fixconf-from-package",
+                        metavar "PKG_FIX_DECL",
+                        help "Packages from which operator declarations will be whitelisted or excluded (examples: --fixconf-from-package containers --fixconf-from-package base=all-'$'-'+' --fixconf-from-package servant=none --fixconf-from-package text=none+':>' )"
+                      ]
+                )
+            -- will be populated later
+            <*> pure []
+            <*> ( (flag' Nothing . mconcat)
+                    [ long "no-fixconf-from-hoogle-hackage",
+                      help "Do not use the Hoogle/Hackage database to infer operator fixities not specified with the other options"
+                    ]
+                    <|> (option (fmap Just parseFcConflictStrategy) . mconcat)
+                      [ long "fixconf-from-hoogle-hackage",
+                        metavar "CONFLICT_STRATEGY",
+                        help "Use the Hoogle/Hackage database to infer operator fixities not specified with the other options, using the specified strategy to resolve conflicting declarations (keep-best, merge-all, or use-threshold=FLOAT with FLOAT in [0,1])"
+                      ]
+                    <|> pure (Just defaultConflictStrategy)
+                )
+        )
 
 sourceTypeParser :: Parser (Maybe SourceType)
 sourceTypeParser =
@@ -334,3 +404,99 @@ parseSourceType = eitherReader $ \case
   "sig" -> Right (Just SignatureSource)
   "auto" -> Right Nothing
   s -> Left $ "unknown source type: " ++ s
+
+unescape :: Text -> Text
+unescape = replace (pack "\\'") (pack "'") . replace (pack "\\\\") (pack "\\")
+
+-- syntax: --fixconf ':>'=infixr-0    -> (":>", FixityInfo (Just InfixR) 0 0)
+--         --fixconf ':>'=0-1        -> (":>", FixityInfo Nothing 0 1)
+--         --fixconf ':>'=infixl-2-9  -> (":>", FixityInfo (Just InfixL) 2 9)
+parseFcOpManualConfig :: ReadM (String, FixityInfo)
+parseFcOpManualConfig = eitherReader $ \s ->
+  case [regex|^'(?<opName>(?:\\\\|\\'|[^\\'])+?)'=(?:(?<fixDir>infix[rl]?)-)?(?<fixPrec>[0-9])(?:-(?<fixMaxPrec>[0-9]))?$|] (pack s) of
+    Just cs ->
+      let (opName, rawFixDir, rawFixPrec, rawFixMaxPrec) =
+            ( unpack . unescape $ capture @"opName" cs,
+              unpack $ capture @"fixDir" cs,
+              unpack $ capture @"fixPrec" cs,
+              unpack $ capture @"fixMaxPrec" cs
+            )
+          fixDir = case rawFixDir of
+            "" -> Nothing
+            "infixr" -> Just InfixR
+            "infixl" -> Just InfixL
+            "infix" -> Just InfixN
+            other ->
+              error $
+                "Invalid fixity direction (fix the regex): " ++ other
+          fixMinPrec = read rawFixPrec :: Int
+          fixMaxPrec =
+            if null rawFixMaxPrec
+              then fixMinPrec
+              else read rawFixMaxPrec
+       in Right (opName, FixityInfo {fixDir, fixMinPrec, fixMaxPrec})
+    Nothing -> Left $ "Invalid fixity config format: " ++ s
+
+-- syntax: --fixconf-from-package containers                 -> ("containers", AllExcept [])
+--         --fixconf-from-package containers=all-':>'-':=>'  -> ("containers", AllExcept [":>", ":=>"])
+--         --fixconf-from-package containers=none            -> ("containers", NoneExcept [])
+--         --fixconf-from-package containers=none+':>'       -> ("containers", NoneExcept [":>"])
+parseFcPackageManualConfig :: ReadM (String, PackageConfig)
+parseFcPackageManualConfig = eitherReader $ \s ->
+  case [regex|^(?<packageName>[A-Za-z0-9-_]+?)(?:=all(?<allExcept>(?:-'(?:\\\\|\\'|[^\\'])+?')*?)|(?<modeNone>=none(?<noneExcept>(?:\+'(?:\\\\|\\'|[^\\'])+?')*?)))?$|] (pack s) of
+    Just cs ->
+      let (packageName, rawAllExceptList, modeNone, rawNoneExceptList) =
+            ( unpack $ capture @"packageName" cs,
+              capture @"allExcept" cs,
+              not . T.null $ capture @"modeNone" cs,
+              capture @"noneExcept" cs
+            )
+          packageConfig =
+            if modeNone
+              then NoneExcept $ getNoneExceptList rawNoneExceptList
+              else AllExcept $ getAllExceptList rawAllExceptList
+       in Right (packageName, packageConfig)
+    Nothing -> Left $ "Invalid fixity config format: " ++ s
+  where
+    getNoneExceptList txt =
+      case [regex|^(?<opName>\+'(?:\\\\|\\'|[^\\'])+?')(?<remaining>.*)$|] txt of
+        Just cs ->
+          let (opName, remaining) =
+                ( unpack . unescape $ capture @"opName" cs,
+                  capture @"remaining" cs
+                )
+           in opName : getNoneExceptList remaining
+        Nothing ->
+          if T.null txt
+            then []
+            else error $ "Unconsumed data: " ++ unpack txt
+    getAllExceptList txt =
+      case [regex|^(?<opName>-'(?:\\\\|\\'|[^\\'])+?')(?<remaining>.*)$|] txt of
+        Just cs ->
+          let (opName, remaining) =
+                ( unpack . unescape $ capture @"opName" cs,
+                  capture @"remaining" cs
+                )
+           in opName : getAllExceptList remaining
+        Nothing ->
+          if T.null txt
+            then []
+            else error $ "Unconsumed data: " ++ unpack txt
+
+-- syntax: keep-best | merge-all | use-threshold=float
+parseFcConflictStrategy :: ReadM ConflictStrategy
+parseFcConflictStrategy = eitherReader $ \s ->
+  case [regex|^(?<strategy>keep-best|merge-all|use-threshold=(?<threshold>(?:0\.?|1\.?|0?\.[0-9]+?|1\.0+?)))$|] (pack s) of
+    Just cs ->
+      let (strategy, rawThreshold) =
+            ( unpack $ capture @"strategy" cs,
+              unpack $ capture @"threshold" cs
+            )
+       in Right $
+            if not (null rawThreshold)
+              then UseThreshold (read rawThreshold)
+              else case strategy of
+                "keep-best" -> KeepBest
+                "merge-all" -> MergeAll
+                other -> error $ "Invalid strategy (fix the regex): " ++ other
+    Nothing -> Left $ "Invalid strategy: " ++ s
