@@ -1,5 +1,4 @@
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ViewPatterns #-}
@@ -13,6 +12,7 @@ module Ormolu.Utils.Cabal
     getCabalInfoForSourceFile,
     findCabalFile,
     parseCabalInfo,
+    getExtensionAndDepsMap,
   )
 where
 

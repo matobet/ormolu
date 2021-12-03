@@ -54,8 +54,8 @@ type FixityMap = HashMap String FixityInfo
 data HoogleHackageInfo = HoogleHackageInfo
   { -- | map package -> {operator -> fixity info} (from Hoogle)
     hPackageToOps :: HashMap String FixityMap,
-    -- | map package -> popularity rating (30 days DL count from Hackage)
-    hPackageToPopularity :: HashMap String Int
+    -- | map package -> popularity rating
+    hPackageToPopularity :: HashMap String Float
   }
   deriving (Eq, Show, Generic)
 
@@ -77,7 +77,7 @@ packageToOps :: HashMap String FixityMap
 
 -- | map package -> popularity deserialized from the embedded
 -- file extract-hoogle-hackage-info/hoogle-hackage-info.json
-packageToPopularity :: HashMap String Int
+packageToPopularity :: HashMap String Float
 HoogleHackageInfo
   { hPackageToOps = packageToOps,
     hPackageToPopularity = packageToPopularity
@@ -215,16 +215,15 @@ mergeFixityMaps threshold packageMaps =
       -- Threshold
       Float ->
       -- List of conflicting (definition, score) for a given operator
-      NonEmpty (FixityInfo, Int) ->
+      NonEmpty (FixityInfo, Float) ->
       -- Resulting fixity, using the specified threshold to choose between
       -- strategy "keep best only" and "merge all"
       FixityInfo
     useThreshold t fixScores =
-      if toFloat maxScore / toFloat sumScores >= t
+      if maxScore / sumScores >= t
         then sconcat . fmap fst $ maxs -- merge potential ex-aequo winners
         else sconcat . fmap fst $ fixScores
       where
-        toFloat x = fromIntegral x :: Float
         maxs = maxWith snd fixScores
         maxScore = snd $ NE.head maxs
         sumScores = foldl' (+) 0 (snd <$> fixScores)
@@ -235,7 +234,7 @@ mergeFixityMaps threshold packageMaps =
       -- Map for a given operator associating each of its conflicting
       -- definitions with their score (= sum of the popularity of the
       -- packages that define it)
-      HashMap FixityInfo Int
+      HashMap FixityInfo Float
     getScores =
       HashMap.map
         (sum . fmap (fromMaybe 0 . flip HashMap.lookup packageToPopularity))

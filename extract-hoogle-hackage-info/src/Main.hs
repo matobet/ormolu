@@ -27,16 +27,17 @@ import qualified Data.ByteString as ByteString
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
+import qualified Data.Map as Map
 import Data.Hashable (Hashable)
 import Data.List
   ( foldl',
     isPrefixOf,
-    sortBy,
+    sortBy, isSuffixOf, sortOn, groupBy
   )
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe
   ( fromJust,
-    fromMaybe,
+    fromMaybe, maybeToList
   )
 import Data.Semigroup (sconcat)
 import Data.Text (Text)
@@ -49,9 +50,6 @@ import Data.Text.Format
 import qualified Data.Text.Format as Format
 import Data.Text.Format.Params (Params)
 import qualified Data.Text.IO as TIO
-  ( putStrLn,
-    readFile,
-  )
 import qualified Data.Text.Lazy as TL
 import GHC.Types.Fixity (FixityDirection (..))
 import GHC.Utils.Monad (mapMaybeM)
@@ -65,7 +63,7 @@ import Ormolu.Fixity
         hPackageToPopularity
       ),
   )
-import System.Directory (listDirectory)
+import System.Directory (listDirectory, makeAbsolute)
 import System.FilePath
   ( makeRelative,
     splitPath,
@@ -84,14 +82,28 @@ import Text.HTML.TagSoup.Match
     tagOpenLit,
   )
 import Text.Regex.Pcre2 (capture, regex)
-import Prelude hiding
-  ( putStrLn,
-    readFile,
-  )
-import Data.List.NonEmpty (NonEmpty)
-import Distribution.PackageDescription
 import Distribution.PackageDescription.Parsec
 import Data.HashSet (HashSet)
+import Ormolu.Utils.Cabal (getExtensionAndDepsMap)
+import Data.Foldable (forM_)
+import Data.Ord (Down(Down))
+import Debug.Trace (trace)
+
+data PopularityConfig = PopularityConfig {
+  revDepBonus :: Float,
+  revDepDlCountRatio :: Float,
+  ownDlCountRatio :: Float,
+  transitiveRatio :: Float
+}
+
+defaultPopularityConfig :: PopularityConfig
+defaultPopularityConfig = PopularityConfig
+  {
+    revDepBonus = 1.0,
+    revDepDlCountRatio = 1.0,
+    ownDlCountRatio = 1.0,
+    transitiveRatio = 0.9
+  }
 
 defaultOutputPath :: FilePath
 defaultOutputPath = "extract-hoogle-hackage-info/hoogle-hackage-info.json"
@@ -169,12 +181,12 @@ walkDir ::
   IO [FilePath]
 walkDir top exclude = do
   ds <- listDirectory top
-  paths <- forM (filter (not . exclude) ds) $ \d -> do
+  paths <- forM ds $ \d -> do
     let path = top </> d
     s <- getFileStatus path
     if isDirectory s
       then walkDir path exclude
-      else return [path]
+      else return $ filter (not . exclude) [path]
   return (concat paths)
 
 getPackageName ::
@@ -399,15 +411,15 @@ getCounts packageToOps = (declCount, packagesCount, distinctOpCount)
 getDependenciesFromCabalFile ::
   FilePath ->
   IO [String]
-getDependenciesFromCabalFile cabalFile = do
-  GenericPackageDescription {packageDescription} <-
-    parseGenericPackageDescriptionMaybe <$> ByteString.readFile cabalFile >>= \case
-      Just gpd -> return gpd
-      Nothing -> throwIO . SimpleException $ format
-        "Unable to parse cabal file {}"
-        (Only cabalFile)
-  let dependencies = allBuildDepends packageDescription
-  return $ unPackageName . depPkgName <$> dependencies
+getDependenciesFromCabalFile cabalFileAsGiven = do
+  cabalFile <- makeAbsolute cabalFileAsGiven
+  cabalFileBs <- ByteString.readFile cabalFile
+  genericPackageDescription <-
+    case parseGenericPackageDescriptionMaybe cabalFileBs of
+      Just gpd -> pure gpd
+      Nothing -> throwIO . SimpleException $ format "Unable to parse cabal file: {}" (Only cabalFile)
+  let extDepMap = getExtensionAndDepsMap cabalFile genericPackageDescription
+  return . concatMap snd . Map.elems $ extDepMap
 
 extractReverseDependenciesFromFile ::
   -- | Hackage database path
@@ -416,7 +428,7 @@ extractReverseDependenciesFromFile ::
   -- | Current file path
   FilePath ->
   IO HackageState
-extractReverseDependenciesFromFile hackageDatabasePath state@HackageState{..} cabalFile = do
+extractReverseDependenciesFromFile hackageDatabasePath HackageState{..} cabalFile = do
   deps <- getDependenciesFromCabalFile cabalFile
   packageName <- T.unpack <$> getPackageName hackageDatabasePath cabalFile
   let hasPackageToRevDeps' = foldl' (insertRevDep packageName) hasPackageToRevDeps deps
@@ -430,7 +442,7 @@ extractReverseDependenciesFromFile hackageDatabasePath state@HackageState{..} ca
 
 extractHackageReverseDependencies :: FilePath -> IO (HashMap String (HashSet String))
 extractHackageReverseDependencies hackageDatabasePath = do
-  cabalFiles <- walkDir hackageDatabasePath (const False)
+  cabalFiles <- walkDir hackageDatabasePath (not . isSuffixOf ".cabal")
   HackageState {..} <-
     foldM
       (extractReverseDependenciesFromFile hackageDatabasePath)
@@ -480,22 +492,142 @@ extractHackageDlCounts filePath = do
     (Only $ HashMap.size result)
   return result
 
-buildTransRevDeps :: HashMap String (HashSet String) -> HashMap String (HashSet String)
-buildTransRevDeps hashmap = buildTransRevDeps' HashMap.empty hashmap where
-  buildTransRevDeps' res lookups
-    | HashMap.size lookups == 0 = res
-    | otherwise = buildTransRevDeps' (HashMap.unionWith (HashSet.union) res lookups) nextLookups where
-      nextLookups = HashMap.filter (not . HashSet.null) $ HashMap.map unionNextDeps 
+pre12 :: (String -> Int) -> HashMap String (HashSet String) -> HashMap (Int, Int) Int
+pre12 nameToIdx = HashMap.fromList . concatMap makePairs . HashMap.toList where
+  makePairs (packageName, revDepsSet) =
+    fmap (\revDepName -> ((nameToIdx packageName, nameToIdx revDepName), 1)) (HashSet.toList revDepsSet)
+post12 :: (Int -> String) -> HashMap (Int, Int) Int -> HashMap String [(String, Int)]
+post12 idxToName = HashMap.fromListWith (<>) . fmap unmakePairs . HashMap.toList where
+  unmakePairs ((packageIdx, revDepIdx), depth) = (idxToName packageIdx, [(idxToName revDepIdx, depth)])
 
-extractHackageInfo :: FilePath -> FilePath -> IO (HashMap String Int)
-extractHackageInfo hackageDlCountsPath hackageDatabasePath = do
+floydWarshallSparse1 :: (Eq k, Hashable k, Ord v, Num v) => HashMap (k, k) v -> HashMap (k, k) v
+floydWarshallSparse1 baseGraph = trace ("  Found " ++ show (length vertices) ++ " vertices") (whileNeq (1 :: Int) floydWarshallStep baseGraph (trace "  Round 1 of Floyd Warshall" (floydWarshallStep baseGraph)))
+  where
+      vertices = HashSet.toList . HashSet.fromList . concatMap (\(a, b) -> [a, b]) . HashMap.keys $ baseGraph
+      whileNeq n f a b
+        | a == b = a
+        | otherwise = whileNeq (n + 1) f b (trace ("  Round " ++ show (n + 1) ++ " of Floyd Warshall") (f b))
+      floydWarshallStep graph = trace ("  " ++ show (HashMap.size graph) ++ " edges and " ++ show (length newEdges) ++ " potential new edges") (insertsWith min newEdges graph) where
+        newEdges = [ ((vI, vJ), lengthIK + lengthKJ) |
+                     ((vI, vK), lengthIK) <- HashMap.toList graph,
+                     ((vK', vJ), lengthKJ) <- HashMap.toList graph,
+                     vK == vK'
+                   ]
+        insertsWith f = flip (foldl' (\hm (k, v) -> HashMap.insertWith f k v hm))
+
+floydWarshallSparse2 :: (Eq k, Hashable k, Ord v, Num v) => HashMap (k, k) v -> HashMap (k, k) v
+floydWarshallSparse2 baseGraph = trace ("  Found " ++ show (length vertices) ++ " vertices") (whileNeq (1 :: Int) floydWarshallStep baseGraph (trace "  Round 1 of Floyd Warshall" (floydWarshallStep baseGraph)))
+  where
+      vertices = HashSet.toList . HashSet.fromList . concatMap (\(a, b) -> [a, b]) . HashMap.keys $ baseGraph
+      whileNeq n f a b
+        | a == b = a
+        | otherwise = whileNeq (n + 1) f b (trace ("  Round " ++ show (n + 1) ++ " of Floyd Warshall") (f b))
+      floydWarshallStep graph = trace ("  " ++ show (HashMap.size graph) ++ " edges and " ++ show (length newEdges) ++ " potential new edges") (insertsWith min newEdges graph) where
+        newEdges = [ ((vI, vJ), lengthIK + lengthKJ) |
+                     ((vI, vK), lengthIK) <- HashMap.toList graph,
+                     vJ <- vertices,
+                     lengthKJ <- maybeToList $ HashMap.lookup (vK, vJ) graph
+                   ]
+        insertsWith f = flip (foldl' (\hm (k, v) -> HashMap.insertWith f k v hm))
+
+pre3 :: (String -> Int) -> HashMap String (HashSet String) -> HashMap Int (HashMap Int Int)
+pre3 nameToIdx = HashMap.fromList . fmap makePairs . HashMap.toList where
+  makePairs (packageName, revDepsSet) =
+    (nameToIdx packageName, HashMap.fromList . fmap (\revDepName -> (nameToIdx revDepName, 1)) . HashSet.toList $ revDepsSet)
+post3 :: (Int -> String) -> HashMap Int (HashMap Int Int) -> HashMap String [(String, Int)]
+post3 idxToName = HashMap.fromList . fmap unmakePairs . HashMap.toList where
+  unmakePairs (packageIdx, neighbours) = (idxToName packageIdx, fmap (\(revDepIdx, depth) -> (idxToName revDepIdx, depth)) . HashMap.toList $ neighbours)
+
+floydWarshallSparse3 :: (Eq k, Hashable k, Ord v, Num v) => HashMap k (HashMap k v) -> HashMap k (HashMap k v)
+floydWarshallSparse3 baseGraph = trace ("  Found " ++ show (length vertices) ++ " vertices") (whileNeq (1 :: Int) floydWarshallStep baseGraph (trace "  Round 1 of Floyd Warshall" (floydWarshallStep baseGraph)))
+  where
+      vertices = HashSet.toList . HashSet.fromList $
+        HashMap.keys baseGraph
+          <> concat (HashMap.map HashMap.keys baseGraph)
+      whileNeq n f a b
+        | a == b = a
+        | otherwise = whileNeq (n + 1) f b (trace ("  Round " ++ show (n + 1) ++ " of Floyd Warshall") (f b))
+      floydWarshallStep graph = trace ("  " ++ show (foldl' (\t shm -> t + HashMap.size shm) 0 graph) ++ " edges and " ++ show (length newEdges) ++ " potential new edges") (insertsWith min newEdges graph) where
+        newEdges = [ ((vI, vJ), lengthIK + lengthKJ) |
+                     (vI, neighbours) <- HashMap.toList graph,
+                     (vK, lengthIK) <- HashMap.toList neighbours,
+                     (vJ, lengthKJ) <- maybe [] HashMap.toList $ HashMap.lookup vK graph
+                   ]
+        insertsWith f = flip (foldl' (\hm ((k1, k2), v) -> HashMap.insertWith (HashMap.unionWith f) k1 (HashMap.singleton k2 v) hm))
+
+pre4 :: (String -> Int) -> HashMap String (HashSet String) -> HashMap Int [(Int, Int)]
+pre4 nameToIdx = HashMap.fromList . fmap makePairs . HashMap.toList where
+  makePairs (packageName, revDepsSet) =
+    (nameToIdx packageName, sortOn fst . fmap (\revDepName -> (nameToIdx revDepName, 1)) . HashSet.toList $ revDepsSet)
+post4 :: (Int -> String) -> HashMap Int [(Int, Int)] -> HashMap String [(String, Int)]
+post4 idxToName = HashMap.fromList . fmap unmakePairs . HashMap.toList where
+  unmakePairs (packageIdx, neighbours) = (idxToName packageIdx, (\(revDepIdx, depth) -> (idxToName revDepIdx, depth)) <$> neighbours)
+
+floydWarshallSparse4 :: (Ord k, Hashable k, Ord v, Num v) => HashMap k [(k, v)] -> HashMap k [(k, v)]
+floydWarshallSparse4 baseGraph = trace ("  Found " ++ show (length vertices) ++ " vertices") (whileNeq (1 :: Int) floydWarshallStep baseGraph (trace "  Round 1 of Floyd Warshall" (floydWarshallStep baseGraph)))
+  where
+      vertices = HashSet.toList . HashSet.fromList $
+        HashMap.keys baseGraph
+          <> concat (HashMap.map (fmap fst) baseGraph)
+      whileNeq n f a b
+        | a == b = a
+        | otherwise = whileNeq (n + 1) f b (trace ("  Round " ++ show (n + 1) ++ " of Floyd Warshall") (f b))
+      floydWarshallStep graph = trace ("  " ++ show (foldl' (\t pairs -> t + length pairs) 0 graph) ++ " edges and " ++ show (length newEdges) ++ " potential new edges") (insertsWithMin (groupEdges newEdges) graph) where
+        newEdges = [ (vI, (vJ, lengthIK + lengthKJ)) |
+                     (vI, neighbours) <- HashMap.toList graph,
+                     (vK, lengthIK) <- neighbours,
+                     (vJ, lengthKJ) <- fromMaybe [] $ HashMap.lookup vK graph
+                   ]
+        groupEdges edges = groupBy (\(src1, _) (src2, _) -> src1 == src2) edges
+        insertsWithMin groupedPairs graph' = foldl' insertPairs graph' groupedPairs where
+          insertPairs hm pairs = let (vI, _):_ = pairs in
+            HashMap.insertWith mergeSortedFst vI (sortOn fst (snd <$> pairs)) hm
+        mergeSortedFst [] xs2 = xs2
+        mergeSortedFst xs1 [] = xs1
+        mergeSortedFst r1@(t1@(v1, l1):xs1) r2@(t2@(v2, l2):xs2)
+          | v1 < v2 = t1 : mergeSortedFst xs1 r2
+          | v1 > v2 = t2 : mergeSortedFst r1 xs2
+          | otherwise = (v1, min l1 l2) : mergeSortedFst xs1 xs2
+
+-- strategies
+-- 1. use list of pairs in strat 3
+-- 2. use unboxed vector of pairs in strat 3
+-- 3. use non-sparse matrix
+-- 4. use topological order
+
+buildTransRevDeps ::
+  Int -> HashMap String (HashSet String) -> HashMap String [(String, Int)]
+buildTransRevDeps strategy hm = case strategy of
+  1 -> post12 idxToName . floydWarshallSparse1 . pre12 nameToIdx $ hm
+  2 -> post12 idxToName . floydWarshallSparse2 . pre12 nameToIdx $ hm
+  3 -> post3 idxToName . floydWarshallSparse3 . pre3 nameToIdx $ hm
+  _ -> post4 idxToName . floydWarshallSparse4 . pre4 nameToIdx $ hm
+  where
+    allKeys = HashSet.toList . HashSet.unions $ (HashMap.keysSet hm : HashMap.elems hm)
+    idxToNameMap = HashMap.fromList $ zip [0..] allKeys
+    nameToIdxMap = HashMap.fromList $ zip allKeys [0..]
+    idxToName = fromJust . flip HashMap.lookup idxToNameMap
+    nameToIdx = fromJust . flip HashMap.lookup nameToIdxMap
+
+buildPackageToPop :: PopularityConfig -> HashMap String Int -> HashMap String [(String, Int)] -> HashMap String Float
+buildPackageToPop PopularityConfig{..} packageToDlCount packageToTransRevDeps =
+    HashMap.unionWith (+)
+        (HashMap.map (\c -> fromIntegral c * ownDlCountRatio) packageToDlCount)
+        (HashMap.map sumDlCounts packageToTransRevDeps)
+    where
+      sumDlCounts revDeps = sum $ (\(revDepName, depth) -> (revDepBonus + revDepDlCountRatio * (fromIntegral . fromMaybe 0 $ HashMap.lookup revDepName packageToDlCount)) * transitiveRatio ** (fromIntegral depth - 1)) <$> revDeps
+
+extractHackageInfo :: FilePath -> FilePath -> PopularityConfig -> IO (HashMap String Float)
+extractHackageInfo hackageDlCountsPath hackageDatabasePath popularityConfig = do
   packageToDlCount <- extractHackageDlCounts hackageDlCountsPath
   packageToRevDeps <- extractHackageReverseDependencies hackageDatabasePath
-  let packageToTransRevDeps = buildTransRevDeps packageToRevDeps
-      packageToPop = HashMap.map sumDlCounts packageToTransRevDeps
-      sumDlCounts revDeps = sum $ (\revDepName -> 1 + (fromMaybe 0 $
-      HashMap.lookup revDepName packageToDlCount)) <$> revDeps
-  return packageToPop
+  let packageToTransRevDeps = buildTransRevDeps 2 packageToRevDeps
+  return $ buildPackageToPop popularityConfig packageToDlCount packageToTransRevDeps
+
+displayTopPackages :: HashMap String Float -> IO ()
+displayTopPackages packageToPop = do
+  let packageToPop' = take 100 . zip ([1..] :: [Int]) . sortOn (Down . snd) . HashMap.toList $ packageToPop
+  forM_ packageToPop' $ \(i, (packageName, score)) -> putFmtLn "{}. {} (score = {})" (Format.left 4 ' ' i, packageName, score)
 
 configParserInfo :: ParserInfo Config
 configParserInfo = info (helper <*> configParser) fullDesc
@@ -533,7 +665,7 @@ main :: IO ()
 main = do
   Config {..} <- execParser configParserInfo
   packageToOps <- extractHoogleInfo cfgHoogleDatabasePath
-  packageToPop <- extractHackageInfo cfgHackageDlCountsPath cfgHackageDatabasePath
+  packageToPop <- extractHackageInfo cfgHackageDlCountsPath cfgHackageDatabasePath defaultPopularityConfig
   let (packageToOps', packageToPop') = case cfgDebugLimit of
         Nothing -> (packageToOps, packageToPop)
         Just n ->
@@ -545,3 +677,4 @@ main = do
       { hPackageToOps = packageToOps',
         hPackageToPopularity = packageToPop'
       }
+  displayTopPackages packageToPop'
