@@ -29,6 +29,7 @@ let
             dontPatchELF = false;
             enableDeadCodeElimination = true;
             packages.ormolu.writeHieFiles = true;
+            enableLibraryProfiling = true;
           };
           # Make Cabal reinstallable
           options.nonReinstallablePkgs =

@@ -1,3 +1,6 @@
 packages: . ormolu-live extract-hackage-info
 
 constraints: ormolu +dev
+
+package ormolu
+  profiling: true

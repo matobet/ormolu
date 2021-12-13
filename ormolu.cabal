@@ -182,3 +182,4 @@ test-suite tests
 
     else
         ghc-options: -O2 -Wall
+    ghc-options: -rtsopts
