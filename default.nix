@@ -11,6 +11,14 @@ let
       keepGitDir = true;
     };
     projectFileName = "cabal.project";
+    cabalProjectLocal = ''
+      source-repository-package
+        type: git
+        location: https://github.com/amesgen/stuff
+        tag: 5a015053c873e8dac3030594c1447b65c388e3d5
+        subdir: 9.4.1-alpha1
+        --sha256: 14ddakk223n1xc6f897jv02m3yd9gin0fcp0m12555nnsiffl7mm
+    '';
     compiler-nix-name = ormoluCompiler;
     modules =
       let

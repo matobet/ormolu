@@ -3,6 +3,7 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- | Rendering of types.
 module Ormolu.Printer.Meat.Type
@@ -22,7 +23,6 @@ module Ormolu.Printer.Meat.Type
   )
 where
 
-import Data.Foldable (for_)
 import GHC.Hs
 import GHC.Types.Basic hiding (isPromoted)
 import GHC.Types.SourceText
@@ -54,12 +54,11 @@ p_hsType' multilineArgs docStyle = \case
       HsForAllVis _ bndrs -> p_forallBndrs ForAllVis p_hsTyVarBndr bndrs
     interArgBreak
     p_hsTypeR (unLoc t)
-  HsQualTy _ qs' t -> do
-    for_ qs' $ \qs -> do
-      located qs p_hsContext
-      space
-      txt "=>"
-      interArgBreak
+  HsQualTy _ qs t -> do
+    located qs p_hsContext
+    space
+    txt "=>"
+    interArgBreak
     case unLoc t of
       HsQualTy {} -> p_hsTypeR (unLoc t)
       HsFunTy {} -> p_hsTypeR (unLoc t)
@@ -101,8 +100,8 @@ p_hsType' multilineArgs docStyle = \case
     space
     case arrow of
       HsUnrestrictedArrow _ -> txt "->"
-      HsLinearArrow _ _ -> txt "%1 ->"
-      HsExplicitMult _ _ mult -> do
+      HsLinearArrow _ -> txt "%1 ->"
+      HsExplicitMult _ mult _ -> do
         txt "%"
         p_hsTypeR (unLoc mult)
         space
@@ -122,7 +121,7 @@ p_hsType' multilineArgs docStyle = \case
   HsSumTy _ xs ->
     parensHash N $
       sep (space >> txt "|" >> breakpoint) (sitcc . located' p_hsType) xs
-  HsOpTy _ x op y -> do
+  HsOpTy _ _ x op y -> do
     fixityOverrides <- askFixityOverrides
     fixityMap <- askFixityMap
     let opTree = OpBranches [tyOpTree x, tyOpTree y] [op]
@@ -144,7 +143,7 @@ p_hsType' multilineArgs docStyle = \case
     breakpoint
     inci (located k p_hsType)
   HsSpliceTy _ splice -> p_hsSplice splice
-  HsDocTy _ t str ->
+  HsDocTy _ t (fmap hsDocString -> str) ->
     case docStyle of
       PipeStyle -> do
         p_hsDocString Pipe True str
@@ -262,11 +261,11 @@ p_conDeclFields xs =
 
 p_conDeclField :: ConDeclField GhcPs -> R ()
 p_conDeclField ConDeclField {..} = do
-  mapM_ (p_hsDocString Pipe True) cd_fld_doc
+  mapM_ (p_hsDocString Pipe True . fmap hsDocString) cd_fld_doc
   sitcc $
     sep
       commaDel
-      (located' (p_rdrName . rdrNameFieldOcc))
+      (located' (p_rdrName . foLabel))
       cd_fld_names
   space
   txt "::"

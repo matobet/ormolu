@@ -143,7 +143,7 @@ matchIgnoringSrcSpans a = genericQuery a
     -- as we normalize arrow styles (e.g. -> vs →), we consider them equal here
     unicodeArrowStyleEq :: HsArrow GhcPs -> GenericQ ParseResultDiff
     unicodeArrowStyleEq (HsUnrestrictedArrow _) (castArrow -> Just (HsUnrestrictedArrow _)) = Same
-    unicodeArrowStyleEq (HsLinearArrow _ _) (castArrow -> Just (HsLinearArrow _ _)) = Same
+    unicodeArrowStyleEq (HsLinearArrow _) (castArrow -> Just (HsLinearArrow _)) = Same
     unicodeArrowStyleEq (HsExplicitMult _ _ t) (castArrow -> Just (HsExplicitMult _ _ t')) = genericQuery t t'
     unicodeArrowStyleEq _ _ = Different []
     castArrow :: Typeable a => a -> Maybe (HsArrow GhcPs)

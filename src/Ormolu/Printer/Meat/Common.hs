@@ -139,6 +139,7 @@ p_hsDocString ::
   -- | The doc string to render
   LHsDocString ->
   R ()
+-- TODO take LHsDoc
 p_hsDocString hstyle needsNewline (L l str) = do
   let isCommentSpan = \case
         HaddockSpan _ _ -> True
